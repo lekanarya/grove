@@ -1,7 +1,7 @@
 # Grove: Log Dashboard & Transport System
 
-
-
+![image1](./assets/screenshot1.png)
+![image2](./assets/screenshot2.png)
 ---
 
 ## Table of Contents
