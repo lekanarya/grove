@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Configuration
 API_URL="https://logs.yourdomain.com/api/logs"
-API_TOKEN="api_key" #Check dashboard
+API_TOKEN="sk_ns7vqkn851lrevtytjtyl8"
 LOG_DIR="/var/log"
 CONFIG_DIR="/etc/grove"
 PID_FILE="/var/run/grove.pid"
@@ -11,11 +11,14 @@ MAX_RETRIES=3
 RETRY_DELAY=2
 
 # PM2 configuration
-PM2_HOME="/home/user/.pm2"
+PM2_HOME="/home/project_name/.pm2"
 PM2_LOGS_DIR="$PM2_HOME/logs"
 
 # Apache configuration
 APACHE_LOGS_DIR="/var/log/apache2"
+
+# Uvicorn/FastAPI configuration
+UVICORN_LOG_FILE="/var/www/html/image-scan/uvicorn.log"
 
 # Ensure directories exist
 mkdir -p "$LOG_DIR" "$CONFIG_DIR"
@@ -164,6 +167,64 @@ parse_pm2_log() {
     }'
 }
 
+# Function to parse Uvicorn/FastAPI log format
+parse_uvicorn_log() {
+    local log_entry="$1"
+
+    # Uvicorn log formats:
+    # INFO:     Started server process [1234]
+    # INFO:     127.0.0.1:56789 - "GET /docs HTTP/1.1" 200
+    # ERROR:    Exception in ASGI application
+    # WARNING:  Something happened
+
+    echo "$log_entry" | awk '{
+        # Handle different Uvicorn log patterns
+
+        # Pattern 1: INFO:     127.0.0.1:56789 - "GET /docs HTTP/1.1" 200
+        if (match($0, /^([A-Z]+):\s+([0-9.]+):([0-9]+) - "([A-Z]+) ([^ ]+) HTTP\/[0-9.]+" ([0-9]+)/, matches)) {
+            level = tolower(matches[1])
+            ip = matches[2]
+            port = matches[3]
+            method = matches[4]
+            path = matches[5]
+            status = matches[6]
+
+            printf "{\"level\": \"%s\", \"ip\": \"%s\", \"port\": \"%s\", \"method\": \"%s\", \"path\": \"%s\", \"status_code\": %s, \"type\": \"access\"}",
+                   level, ip, port, method, path, status
+        }
+        # Pattern 2: INFO:     Started server process [1234]
+        else if (match($0, /^([A-Z]+):\s+Started server process \[([0-9]+)\]/, matches)) {
+            level = tolower(matches[1])
+            pid = matches[2]
+
+            printf "{\"level\": \"%s\", \"pid\": \"%s\", \"type\": \"server\", \"event\": \"started\"}",
+                   level, pid
+        }
+        # Pattern 3: INFO:     Waiting for application startup.
+        else if (match($0, /^([A-Z]+):\s+(.*)$/, matches)) {
+            level = tolower(matches[1])
+            message = matches[2]
+
+            # Determine event type based on message content
+            event_type = "general"
+            if (match(message, /(startup|started)/)) event_type = "startup"
+            else if (match(message, /(shutdown|stopping)/)) event_type = "shutdown"
+            else if (match(message, /(error|exception|failed)/)) event_type = "error"
+
+            printf "{\"level\": \"%s\", \"message\": \"%s\", \"type\": \"%s\"}",
+                   level, message, event_type
+        }
+        # Pattern 4: Handle stack traces and multi-line errors
+        else if (match($0, /^\s+(at |File |Traceback)/, matches)) {
+            printf "{\"level\": \"error\", \"message\": \"%s\", \"type\": \"stacktrace\"}", $0
+        }
+        # Default: treat as general message
+        else {
+            printf "{\"level\": \"info\", \"message\": \"%s\", \"type\": \"general\"}", $0
+        }
+    }'
+}
+
 # Function to determine log level for Laravel logs
 determine_laravel_level() {
     local message="$1"
@@ -221,11 +282,31 @@ determine_pm2_level() {
     fi
 }
 
+# Function to determine log level for Uvicorn logs
+determine_uvicorn_level() {
+    local message="$1"
+
+    if echo "$message" | grep -qi "^ERROR:"; then
+        echo "error"
+    elif echo "$message" | grep -qi "^WARNING:"; then
+        echo "warning"
+    elif echo "$message" | grep -qi "^DEBUG:"; then
+        echo "debug"
+    elif echo "$message" | grep -qi "^CRITICAL:"; then
+        echo "critical"
+    elif echo "$message" | grep -qi "error\|exception\|fail\|traceback"; then
+        echo "error"
+    elif echo "$message" | grep -qi "warn"; then
+        echo "warning"
+    else
+        echo "info"
+    fi
+}
+
 # Function to determine log level for other logs
 determine_level() {
     local message="$1"
     local log_type="$2"
-
     if [ "$log_type" = "error" ]; then
         echo "error"
     elif echo "$message" | grep -qi "warn"; then
@@ -261,7 +342,6 @@ process_system_metrics() {
 
     # Generate random cores between 4-11 as in the original
     local cores=$((4 + RANDOM % 8))
-
     # Create meaningful message instead of empty string
     local message="System metrics - CPU: ${cpu_usage}%, Memory: ${mem_usage_percent}%, Disk: ${disk_usage}%"
 
@@ -343,7 +423,6 @@ process_log_line() {
     local source="$2"
     local log_type="$3"
     local file_path="$4"
-
     local id=$(generate_id "${file_path}-${line}")
     local timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
@@ -355,6 +434,8 @@ process_log_line() {
         level=$(determine_pm2_level "$line" "$log_type")
     elif [ "$source" = "apache" ]; then
         level=$(determine_apache_level "$line" "$log_type")
+    elif [ "$source" = "uvicorn" ]; then
+        level=$(determine_uvicorn_level "$line")
     else
         level=$(determine_level "$line" "$log_type")
     fi
@@ -374,6 +455,8 @@ process_log_line() {
         details=$(parse_laravel_log "$line")
     elif [ "$source" = "pm2" ]; then
         details=$(parse_pm2_log "$line")
+    elif [ "$source" = "uvicorn" ]; then
+        details=$(parse_uvicorn_log "$line")
     fi
 
     # Create the log entry with sanitized message
@@ -420,6 +503,12 @@ check_log_source() {
         pm2)
             if [ ! -d "$PM2_LOGS_DIR" ]; then
                 echo "$(date '+%Y-%m-%d %H:%M:%S') - PM2 logs directory not found: $PM2_LOGS_DIR" >> "${LOG_DIR}/grove.log"
+                return 1
+            fi
+            ;;
+        uvicorn)
+            if [ ! -f "$pattern" ]; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') - Uvicorn log file not found: $pattern" >> "${LOG_DIR}/grove.log"
                 return 1
             fi
             ;;
@@ -515,6 +604,20 @@ read_multiline_log() {
                 done
             fi
             ;;
+        uvicorn)
+            # Uvicorn stack traces and multi-line errors
+            if echo "$first_line" | grep -q -E "(ERROR:|CRITICAL:|Exception|Traceback|at .+\.(py|js))"; then
+                while IFS= read -r next_line && [ -n "$next_line" ]; do
+                    # Stop reading if we hit the next log entry (starts with log level)
+                    if echo "$next_line" | grep -q "^[A-Z]+:"; then
+                        echo "$next_line" >&3
+                        break
+                    else
+                        log_entry="$log_entry\\n$next_line"
+                    fi
+                done
+            fi
+            ;;
         nginx|system)
             # System logs typically don't have multi-line entries
             ;;
@@ -588,6 +691,30 @@ monitor_pm2_logs() {
             done
         ) &
     done
+
+    return 0
+}
+
+# Function to monitor Uvicorn logs with graceful error handling
+monitor_uvicorn_logs() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - Starting Uvicorn log monitor" >> "${LOG_DIR}/grove.log"
+
+    # Check if Uvicorn log file exists
+    if ! check_log_source "uvicorn" "$UVICORN_LOG_FILE"; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') - Uvicorn log file not found, skipping: $UVICORN_LOG_FILE" >> "${LOG_DIR}/grove.log"
+        return 0  # Skip gracefully
+    fi
+
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - Monitoring Uvicorn log: $UVICORN_LOG_FILE" >> "${LOG_DIR}/grove.log"
+
+    # Monitor the Uvicorn log file
+    tail -n 0 -F "$UVICORN_LOG_FILE" 2>/dev/null | while read -r line; do
+        if [ -n "$line" ]; then
+            local log_entry=$(read_multiline_log "uvicorn" "application" "$line")
+            local processed_entry=$(process_log_line "$log_entry" "uvicorn" "application" "$UVICORN_LOG_FILE")
+            send_to_api "$processed_entry" &
+        fi
+    done 3<&0
 
     return 0
 }
@@ -677,7 +804,7 @@ collect_system_metrics() {
 # Main function with graceful error handling for all log sources
 main() {
     echo "Starting log collector..." >> "${LOG_DIR}/grove.log"
-    echo $$ > "$PID_FILE"
+    echo $ > "$PID_FILE"
 
     # Test API connection first with retries
     if ! test_api_connection; then
@@ -703,6 +830,9 @@ main() {
 
     # Monitor PM2 logs with graceful error handling
     monitor_pm2_logs &
+
+    # Monitor Uvicorn/FastAPI logs with graceful error handling
+    monitor_uvicorn_logs &
 
     # Wait for all background processes (this will keep the script running)
     echo "$(date '+%Y-%m-%d %H:%M:%S') - Log collector started successfully. Monitoring logs..." >> "${LOG_DIR}/grove.log"

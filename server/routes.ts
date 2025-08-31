@@ -400,68 +400,6 @@ const waitForIndex = async (
   );
 };
 
-const waitForTask = async (
-  taskUid: number,
-  maxRetries: number = 5,
-  initialDelayMs: number = 1000,
-): Promise<string> => {
-  console.log(`Waiting for task ${taskUid} to complete...`);
-
-  for (let i = 0; i < maxRetries; i++) {
-    try {
-      const task = await client.tasks.getTask(taskUid);
-
-      if (task.status === "succeeded") {
-        console.log(
-          `Task ${taskUid} completed successfully after ${i + 1} attempt(s)`,
-        );
-        return task.status;
-      }
-
-      if (task.status === "failed") {
-        console.error(`Task ${taskUid} failed:`, task.error);
-        throw new Error(
-          `Task ${taskUid} failed: ${task.error?.message || "Unknown error"}`,
-        );
-      }
-
-      if (i < maxRetries - 1) {
-        const delay = initialDelayMs * Math.pow(1.5, i);
-        console.log(
-          `Task ${taskUid} status: ${task.status}, retrying in ${Math.round(delay)}ms... (attempt ${i + 1}/${maxRetries})`,
-        );
-        await new Promise((resolve) => setTimeout(resolve, delay));
-        continue;
-      }
-
-      console.warn(
-        `Task ${taskUid} still processing after ${maxRetries} attempts`,
-      );
-      return task.status;
-    } catch (error: any) {
-      if (
-        (error.code === "task_not_found" ||
-          error.cause?.code === "task_not_found") &&
-        i < maxRetries - 1
-      ) {
-        console.log(
-          `Task ${taskUid} not found, retrying in ${initialDelayMs}ms... (attempt ${i + 1}/${maxRetries})`,
-        );
-        await new Promise((resolve) => setTimeout(resolve, initialDelayMs));
-        continue;
-      }
-
-      console.error(
-        `Failed to get task ${taskUid} after ${i + 1} attempts:`,
-        error,
-      );
-      throw error;
-    }
-  }
-
-  throw new Error(`Task ${taskUid} not completed after ${maxRetries} retries`);
-};
-
 async function initializeDefaults() {
   try {
     // First, check if grove.json exists
@@ -644,9 +582,21 @@ const initializeIndexSettings = async (): Promise<void> => {
     // Configure settings for logs index
     await logIndex.updateSettings({
       sortableAttributes: ["id", "timestamp", "source", "level", "project"],
-      filterableAttributes: ["id", "source", "level", "timestamp", "project"],
+      filterableAttributes: [
+        "id",
+        "source",
+        "level",
+        "timestamp",
+        "project",
+        "details.statusCode",
+        "details.duration",
+      ],
       searchableAttributes: ["message", "source"],
+      pagination: {
+        maxTotalHits: 10000,
+      },
     });
+
     console.log(`Meilisearch index '${LOGS_INDEX}' settings configured`);
 
     // Alerts index settings
@@ -2410,6 +2360,7 @@ const registerRoutes = async (app: Express): Promise<Server> => {
         const { timeRange = "24h", project } = req.query;
         const index = client.index(LOGS_INDEX);
         const now = new Date();
+
         const timeRangeMs = {
           "1h": 60 * 60 * 1000,
           "24h": 24 * 60 * 60 * 1000,
@@ -2420,31 +2371,56 @@ const registerRoutes = async (app: Express): Promise<Server> => {
           "180d": 180 * 24 * 60 * 60 * 1000,
           "365d": 365 * 24 * 60 * 60 * 1000,
         };
+
         const startTime = new Date(
           now.getTime() -
             (timeRangeMs[timeRange as keyof typeof timeRangeMs] ||
               timeRangeMs["24h"]),
         );
-        let filter = `timestamp >= "${startTime.toISOString()}"`;
+
+        // Build filter with available filterable attributes
+        let filter: string[] = [`timestamp >= ${startTime.getTime()}`];
         if (project && project !== "all") {
-          filter += ` AND project = "${project}"`;
+          filter.push(`project = "${project}"`);
         }
-        const results = await index.search("", {
-          filter,
-          limit: 10000,
-        });
-        const logs = results.hits as any[];
-        const totalRequests = logs.length;
-        const errorLogs = logs.filter(
-          (log) =>
-            log.level === "error" ||
-            (log.details?.statusCode && log.details.statusCode >= 400),
+
+        // Use aggregation queries instead of fetching all documents
+        const [totalResults, errorResults, durationResults] = await Promise.all(
+          [
+            // Total requests count
+            index.search("", {
+              filter,
+              limit: 0,
+              attributesToRetrieve: [],
+            }),
+
+            // Error logs count - use only filterable attributes
+            index.search("", {
+              filter: [...filter, 'level = "error"'],
+              limit: 0,
+              attributesToRetrieve: [],
+            }),
+
+            // Response time metrics
+            index.search("", {
+              filter: [...filter, "details.duration EXISTS"],
+              limit: 10000,
+              attributesToRetrieve: ["details.duration"],
+              sort: ["timestamp:desc"],
+            }),
+          ],
         );
+
+        const totalRequests = totalResults.estimatedTotalHits || 0;
+        const errorCount = errorResults.estimatedTotalHits || 0;
         const errorRate =
-          totalRequests > 0 ? (errorLogs.length / totalRequests) * 100 : 0;
-        const responseTimes = logs
-          .filter((log) => log.details?.duration)
-          .map((log) => log.details.duration);
+          totalRequests > 0 ? (errorCount / totalRequests) * 100 : 0;
+
+        // Calculate average response time from sampled data
+        const durationLogs = durationResults.hits as any[];
+        const responseTimes = durationLogs.map(
+          (log) => log.details?.duration || 0,
+        );
         const avgResponseTime =
           responseTimes.length > 0
             ? responseTimes.reduce((sum, time) => sum + time, 0) /
@@ -2461,210 +2437,62 @@ const registerRoutes = async (app: Express): Promise<Server> => {
         const requestsPerMinute =
           timeRangeMinutes > 0 ? totalRequests / timeRangeMinutes : 0;
 
-        // Generate time series data (simplified)
-        const intervals = 20;
+        // Generate time series data
+        const intervals = Math.min(20, Math.ceil(timeRangeMinutes / 60));
         const intervalMs =
           (timeRangeMs[timeRange as keyof typeof timeRangeMs] ||
             timeRangeMs["24h"]) / intervals;
-        const requestData = [];
-        const errorRateData = [];
+
+        const timeSeriesPromises = [];
         for (let i = 0; i < intervals; i++) {
           const intervalStart = new Date(startTime.getTime() + i * intervalMs);
           const intervalEnd = new Date(intervalStart.getTime() + intervalMs);
-          const intervalLogs = logs.filter((log) => {
-            const logTime = new Date(log.timestamp);
-            return logTime >= intervalStart && logTime < intervalEnd;
-          });
-          const intervalErrors = intervalLogs.filter(
-            (log) =>
-              log.level === "error" ||
-              (log.details?.statusCode && log.details.statusCode >= 400),
-          );
-          requestData.push(Math.max(0, intervalLogs.length));
-          errorRateData.push(
-            intervalLogs.length > 0
-              ? (intervalErrors.length / intervalLogs.length) * 100
-              : 0,
-          );
 
-          // ALERT RULE MONITORING ENDPOINTS
+          const intervalFilter = [
+            ...filter,
+            `timestamp >= ${intervalStart.getTime()}`,
+            `timestamp < ${intervalEnd.getTime()}`,
+          ];
 
-          // GET /api/alert-rules/monitoring/status - Get monitoring status
-          app.get(
-            "/api/alert-rules/monitoring/status",
-            authenticateApiKey,
-            async (req: Request, res: Response, next: NextFunction) => {
-              try {
-                const stats = alertMonitoringService.getMonitoringStats();
-                const ruleStates = await alertMonitoringService.getRuleStates();
-
-                res.json({
-                  success: true,
-                  data: {
-                    ...stats,
-                    ruleStates: ruleStates.slice(0, 10), // Limit to 10 most recent for performance
-                  },
-                });
-              } catch (error: any) {
-                next(error);
-              }
-            },
-          );
-
-          // POST /api/alert-rules/monitoring/start - Start monitoring
-          app.post(
-            "/api/alert-rules/monitoring/start",
-            authenticateApiKey,
-            async (req: Request, res: Response, next: NextFunction) => {
-              try {
-                const { intervalMs = 30000 } = req.body;
-
-                if (intervalMs < 10000 || intervalMs > 300000) {
-                  return res.status(400).json({
-                    success: false,
-                    message:
-                      "Interval must be between 10 seconds and 5 minutes",
-                  });
-                }
-
-                await alertMonitoringService.startMonitoring(intervalMs);
-
-                res.json({
-                  success: true,
-                  message: `Alert rule monitoring started with ${intervalMs}ms interval`,
-                });
-              } catch (error: any) {
-                next(error);
-              }
-            },
-          );
-
-          // POST /api/alert-rules/monitoring/stop - Stop monitoring
-          app.post(
-            "/api/alert-rules/monitoring/stop",
-            authenticateApiKey,
-            async (req: Request, res: Response, next: NextFunction) => {
-              try {
-                alertMonitoringService.stopMonitoring();
-
-                res.json({
-                  success: true,
-                  message: "Alert rule monitoring stopped",
-                });
-              } catch (error: any) {
-                next(error);
-              }
-            },
-          );
-
-          // GET /api/alert-rules/monitoring/states - Get all rule states
-          app.get(
-            "/api/alert-rules/monitoring/states",
-            authenticateApiKey,
-            async (req: Request, res: Response, next: NextFunction) => {
-              try {
-                const ruleStates = await alertMonitoringService.getRuleStates();
-
-                res.json({
-                  success: true,
-                  data: ruleStates,
-                  total: ruleStates.length,
-                });
-              } catch (error: any) {
-                next(error);
-              }
-            },
-          );
-
-          // POST /api/alert-rules/monitoring/reset/:ruleId - Reset rule state
-          app.post(
-            "/api/alert-rules/monitoring/reset/:ruleId",
-            authenticateApiKey,
-            async (req: Request, res: Response, next: NextFunction) => {
-              try {
-                const { ruleId } = req.params;
-
-                if (!ruleId) {
-                  return res.status(400).json({
-                    success: false,
-                    message: "Rule ID is required",
-                  });
-                }
-
-                await alertMonitoringService.resetRuleState(ruleId);
-
-                res.json({
-                  success: true,
-                  message: `Rule state reset for rule: ${ruleId}`,
-                });
-              } catch (error: any) {
-                next(error);
-              }
-            },
-          );
-
-          // POST /api/alert-rules/monitoring/test/:ruleId - Test specific rule
-          app.post(
-            "/api/alert-rules/monitoring/test/:ruleId",
-            authenticateApiKey,
-            async (req: Request, res: Response, next: NextFunction) => {
-              try {
-                const { ruleId } = req.params;
-
-                if (!ruleId) {
-                  return res.status(400).json({
-                    success: false,
-                    message: "Rule ID is required",
-                  });
-                }
-
-                // Get the specific rule
-                const index: Index = client.index(ALERT_RULES_INDEX);
-                const ruleResults = await index.search("", {
-                  filter: `id = "${ruleId}"`,
-                  limit: 1,
-                });
-
-                if (ruleResults.hits.length === 0) {
-                  return res.status(404).json({
-                    success: false,
-                    message: "Alert rule not found",
-                  });
-                }
-
-                const rule = ruleResults.hits[0] as AlertRule;
-
-                if (!rule.enabled) {
-                  return res.status(400).json({
-                    success: false,
-                    message: "Cannot test disabled rule",
-                  });
-                }
-
-                res.json({
-                  success: true,
-                  message: `Test initiated for rule: ${rule.name}`,
-                  data: {
-                    ruleId: rule.id,
-                    ruleName: rule.name,
-                    metric: rule.metric,
-                    condition: rule.condition,
-                    threshold: rule.threshold,
-                  },
-                });
-              } catch (error: any) {
-                next(error);
-              }
-            },
+          timeSeriesPromises.push(
+            Promise.all([
+              // Total requests in interval
+              index.search("", {
+                filter: intervalFilter,
+                limit: 0,
+                attributesToRetrieve: [],
+              }),
+              // Error requests in interval
+              index.search("", {
+                filter: [...intervalFilter, 'level = "error"'],
+                limit: 0,
+                attributesToRetrieve: [],
+              }),
+            ]),
           );
         }
+
+        const timeSeriesResults = await Promise.all(timeSeriesPromises);
+
+        const requestData: number[] = [];
+        const errorRateData: number[] = [];
+
+        timeSeriesResults.forEach(([totalResult, errorResult]) => {
+          const intervalTotal = totalResult.estimatedTotalHits || 0;
+          const intervalErrors = errorResult.estimatedTotalHits || 0;
+
+          requestData.push(intervalTotal);
+          errorRateData.push(
+            intervalTotal > 0 ? (intervalErrors / intervalTotal) * 100 : 0,
+          );
+        });
 
         res.json({
           success: true,
           data: {
-            totalRequests: Math.round(totalRequests),
-            requestsPerMinute: parseFloat(requestsPerMinute.toFixed(2)), // Return as float with 2 decimal places
-            errorRate: Math.round(errorRate * 100) / 100,
+            totalRequests,
+            requestsPerMinute: parseFloat(requestsPerMinute.toFixed(2)),
+            errorRate: parseFloat(errorRate.toFixed(2)),
             avgResponseTime: Math.round(avgResponseTime),
             uptime: 99.98,
             requestData,
@@ -2676,6 +2504,308 @@ const registerRoutes = async (app: Express): Promise<Server> => {
         res.status(500).json({
           success: false,
           message: "Failed to fetch overview metrics",
+          error:
+            process.env.NODE_ENV === "development" ? error.message : undefined,
+        });
+      }
+    },
+  );
+
+  // GET /api/metrics/performance - Get performance metrics from logs
+  app.get(
+    "/api/metrics/performance",
+    authenticateApiKey,
+    async (req: Request, res: Response, next: NextFunction) => {
+      try {
+        const { timeRange = "24h", project } = req.query;
+        const index = client.index(LOGS_INDEX);
+
+        // Calculate time range
+        const now = new Date();
+        const timeRangeMs = {
+          "1h": 60 * 60 * 1000,
+          "24h": 24 * 60 * 60 * 1000,
+          "7d": 7 * 24 * 60 * 60 * 1000,
+          "30d": 30 * 24 * 60 * 60 * 1000,
+        };
+
+        const startTime = new Date(
+          now.getTime() -
+            (timeRangeMs[timeRange as keyof typeof timeRangeMs] ||
+              timeRangeMs["24h"]),
+        );
+
+        // Build filter with available filterable attributes
+        let filter: string[] = [
+          `timestamp >= ${startTime.getTime()}`,
+          "details.duration EXISTS", // This should work if details.duration is filterable
+        ];
+
+        if (project && project !== "all") {
+          filter.push(`project = "${project}"`);
+        }
+
+        // Get aggregated metrics
+        const [statsResult, sampledLogs] = await Promise.all([
+          // Get overall statistics
+          index.search("", {
+            filter,
+            limit: 0,
+            attributesToRetrieve: ["details.duration"],
+          }),
+
+          // Get sampled logs for time series
+          index.search("", {
+            filter,
+            limit: 10000,
+            attributesToRetrieve: ["timestamp", "details.duration"],
+            sort: ["timestamp:desc"],
+          }),
+        ]);
+
+        const logs = sampledLogs.hits as any[];
+
+        // Calculate response time metrics from sampled data
+        const responseTimes = logs.map((log) => log.details?.duration || 0);
+        const avgResponseTime =
+          responseTimes.length > 0
+            ? responseTimes.reduce((sum, time) => sum + time, 0) /
+              responseTimes.length
+            : 0;
+
+        const maxResponseTime =
+          responseTimes.length > 0 ? Math.max(...responseTimes) : 0;
+        const minResponseTime =
+          responseTimes.length > 0 ? Math.min(...responseTimes) : 0;
+
+        // Generate time series data
+        const intervals = 20;
+        const intervalMs =
+          (timeRangeMs[timeRange as keyof typeof timeRangeMs] ||
+            timeRangeMs["24h"]) / intervals;
+
+        const responseTimeData: number[] = [];
+        const throughputData: number[] = [];
+
+        for (let i = 0; i < intervals; i++) {
+          const intervalStart = new Date(startTime.getTime() + i * intervalMs);
+          const intervalEnd = new Date(intervalStart.getTime() + intervalMs);
+
+          const intervalLogs = logs.filter((log) => {
+            const logTime = new Date(log.timestamp);
+            return logTime >= intervalStart && logTime < intervalEnd;
+          });
+
+          const intervalResponseTimes = intervalLogs.map(
+            (log) => log.details?.duration || 0,
+          );
+          const intervalAvgResponseTime =
+            intervalResponseTimes.length > 0
+              ? intervalResponseTimes.reduce((sum, time) => sum + time, 0) /
+                intervalResponseTimes.length
+              : 0;
+
+          responseTimeData.push(Math.round(intervalAvgResponseTime));
+          throughputData.push(intervalLogs.length);
+        }
+
+        res.json({
+          success: true,
+          data: {
+            avgResponseTime: Math.round(avgResponseTime),
+            maxResponseTime: Math.round(maxResponseTime),
+            minResponseTime: Math.round(minResponseTime),
+            totalRequests: statsResult.estimatedTotalHits || 0,
+            responseTimeData,
+            throughputData,
+          },
+        });
+      } catch (error: any) {
+        console.error("Error fetching performance metrics:", error);
+        res.status(500).json({
+          success: false,
+          message: "Failed to fetch performance metrics",
+          error:
+            process.env.NODE_ENV === "development" ? error.message : undefined,
+        });
+      }
+    },
+  );
+
+  // GET /api/metrics/resources - Get resource metrics
+  app.get(
+    "/api/metrics/resources",
+    authenticateApiKey,
+    async (req: Request, res: Response, next: NextFunction) => {
+      try {
+        const { timeRange = "24h", project, server } = req.query;
+
+        // Calculate time range
+        const now = new Date();
+        const timeRangeMs = {
+          "1h": 60 * 60 * 1000,
+          "24h": 24 * 60 * 60 * 1000,
+          "7d": 7 * 24 * 60 * 60 * 1000,
+          "30d": 30 * 24 * 60 * 60 * 1000,
+        };
+
+        const startTime = new Date(
+          now.getTime() -
+            (timeRangeMs[timeRange as keyof typeof timeRangeMs] ||
+              timeRangeMs["24h"]),
+        );
+
+        // Build filter for system metrics using available filterable attributes
+        let filter: string[] = [
+          'source = "system_metrics"',
+          `timestamp >= ${startTime.getTime()}`,
+        ];
+
+        if (project && project !== "all") {
+          filter.push(`project = "${project}"`);
+        }
+        if (server && server !== "all") {
+          filter.push(`server = "${server}"`);
+        }
+
+        const logsIndex = client.index(LOGS_INDEX);
+        const results = await logsIndex.search("", {
+          filter,
+          limit: 10000,
+          attributesToRetrieve: [
+            "timestamp",
+            "cpu",
+            "memory",
+            "disk",
+            "network",
+          ],
+          sort: ["timestamp:desc"],
+        });
+
+        const systemMetrics = results.hits as any[];
+        const useRealData = systemMetrics.length > 0;
+
+        // Process metrics in reverse chronological order (newest first)
+        systemMetrics.reverse();
+
+        const intervals = 20;
+        const intervalMs =
+          (timeRangeMs[timeRange as keyof typeof timeRangeMs] ||
+            timeRangeMs["24h"]) / intervals;
+
+        const cpuUsageData: number[] = [];
+        const memoryUsageData: number[] = [];
+        const diskUsageData: number[] = [];
+        const networkData: number[] = [];
+
+        let currentCpuUsage = 0;
+        let currentMemoryUsage = 0;
+        let maxCpuUsage = 0;
+        let maxMemoryUsage = 0;
+        let avgCpuUsage = 0;
+        let avgMemoryUsage = 0;
+
+        if (useRealData) {
+          // Group metrics by time intervals
+          for (let i = 0; i < intervals; i++) {
+            const intervalStart = new Date(
+              startTime.getTime() + i * intervalMs,
+            );
+            const intervalEnd = new Date(intervalStart.getTime() + intervalMs);
+
+            const intervalMetrics = systemMetrics.filter((metric) => {
+              const metricTime = new Date(metric.timestamp);
+              return metricTime >= intervalStart && metricTime < intervalEnd;
+            });
+
+            if (intervalMetrics.length > 0) {
+              const avgCpu =
+                intervalMetrics.reduce(
+                  (sum, m) => sum + (m.cpu?.usage || 0),
+                  0,
+                ) / intervalMetrics.length;
+              const avgMem =
+                intervalMetrics.reduce(
+                  (sum, m) => sum + (m.memory?.usage_percent || 0),
+                  0,
+                ) / intervalMetrics.length;
+
+              cpuUsageData.push(parseFloat((avgCpu * 100).toFixed(2)));
+              memoryUsageData.push(parseFloat(avgMem.toFixed(2)));
+
+              // Use the most recent disk and network data in the interval
+              const latestMetric = intervalMetrics[intervalMetrics.length - 1];
+              const diskUsage =
+                latestMetric?.disk?.usage?.["/"]?.usage_percent || 0;
+
+              const networkIn = Object.values(
+                latestMetric?.network || {},
+              ).reduce(
+                (sum: number, iface: any) =>
+                  sum + (iface.rx_rate_bytes_per_sec || 0),
+                0,
+              );
+
+              diskUsageData.push(diskUsage);
+              networkData.push(Math.round(networkIn / 1024));
+            } else {
+              // No data for this interval
+              cpuUsageData.push(0);
+              memoryUsageData.push(0);
+              diskUsageData.push(0);
+              networkData.push(0);
+            }
+          }
+
+          // Calculate current and aggregate values from the most recent data
+          const latestMetric = systemMetrics[systemMetrics.length - 1];
+          currentCpuUsage = (latestMetric?.cpu?.usage || 0) * 100;
+          currentMemoryUsage = latestMetric?.memory?.usage_percent || 0;
+
+          maxCpuUsage = Math.max(...cpuUsageData.filter((val) => val > 0));
+          maxMemoryUsage = Math.max(
+            ...memoryUsageData.filter((val) => val > 0),
+          );
+
+          const validCpuData = cpuUsageData.filter((val) => val > 0);
+          const validMemData = memoryUsageData.filter((val) => val > 0);
+
+          avgCpuUsage =
+            validCpuData.length > 0
+              ? validCpuData.reduce((sum, val) => sum + val, 0) /
+                validCpuData.length
+              : 0;
+
+          avgMemoryUsage =
+            validMemData.length > 0
+              ? validMemData.reduce((sum, val) => sum + val, 0) /
+                validMemData.length
+              : 0;
+        }
+
+        res.json({
+          success: true,
+          data: {
+            currentCpuUsage: parseFloat(currentCpuUsage.toFixed(2)),
+            maxCpuUsage: parseFloat(maxCpuUsage.toFixed(2)),
+            avgCpuUsage: parseFloat(avgCpuUsage.toFixed(2)),
+            currentMemoryUsage: parseFloat(currentMemoryUsage.toFixed(2)),
+            maxMemoryUsage: parseFloat(maxMemoryUsage.toFixed(2)),
+            avgMemoryUsage: parseFloat(avgMemoryUsage.toFixed(2)),
+            cpuUsageData,
+            memoryUsageData,
+            diskUsageData,
+            networkData,
+            dataSource: useRealData ? "system_metrics" : "none",
+            hasRealData: useRealData,
+            totalDataPoints: systemMetrics.length,
+          },
+        });
+      } catch (error: any) {
+        console.error("Error fetching resource metrics:", error);
+        res.status(500).json({
+          success: false,
+          message: "Failed to fetch resource metrics",
           error:
             process.env.NODE_ENV === "development" ? error.message : undefined,
         });
@@ -3158,293 +3288,6 @@ const registerRoutes = async (app: Express): Promise<Server> => {
         res.status(500).json({
           success: false,
           message: "Failed to check alert system health",
-          error:
-            process.env.NODE_ENV === "development" ? error.message : undefined,
-        });
-      }
-    },
-  );
-
-  // GET /api/metrics/performance - Get performance metrics from logs
-  app.get(
-    "/api/metrics/performance",
-    authenticateApiKey,
-    async (req: Request, res: Response, next: NextFunction) => {
-      try {
-        const { timeRange = "24h", project } = req.query;
-        const index = client.index(LOGS_INDEX);
-
-        // Calculate time range
-        const now = new Date();
-        const timeRangeMs = {
-          "1h": 60 * 60 * 1000,
-          "24h": 24 * 60 * 60 * 1000,
-          "7d": 7 * 24 * 60 * 60 * 1000,
-          "30d": 30 * 24 * 60 * 60 * 1000,
-        };
-        const startTime = new Date(
-          now.getTime() -
-            (timeRangeMs[timeRange as keyof typeof timeRangeMs] ||
-              timeRangeMs["24h"]),
-        );
-
-        // Get logs with response time data
-        // Build filter for logs - use ISO string format for timestamp
-        let filter = `timestamp >= "${startTime.toISOString()}"`;
-        if (project && project !== "all") {
-          filter += ` AND project = "${project}"`;
-        }
-
-        // Get all logs in time range for performance analysis
-        const results = await index.search("", {
-          filter,
-          limit: 10000,
-        });
-
-        const logs = results.hits as any[];
-        const logsWithDuration = logs.filter((log) => log.details?.duration);
-
-        // Calculate response time metrics
-        const responseTimes = logsWithDuration.map(
-          (log) => log.details.duration,
-        );
-        const avgResponseTime =
-          responseTimes.length > 0
-            ? responseTimes.reduce((sum, time) => sum + time, 0) /
-              responseTimes.length
-            : 0;
-        const maxResponseTime =
-          responseTimes.length > 0 ? Math.max(...responseTimes) : 0;
-        const minResponseTime =
-          responseTimes.length > 0 ? Math.min(...responseTimes) : 0;
-
-        // Generate time series data
-        const intervals = 20;
-        const intervalMs =
-          (timeRangeMs[timeRange as keyof typeof timeRangeMs] ||
-            timeRangeMs["24h"]) / intervals;
-        const responseTimeData = [];
-        const throughputData = [];
-
-        for (let i = 0; i < intervals; i++) {
-          const intervalStart = new Date(startTime.getTime() + i * intervalMs);
-          const intervalEnd = new Date(intervalStart.getTime() + intervalMs);
-
-          const intervalLogs = logs.filter((log) => {
-            const logTime = new Date(log.timestamp);
-            return logTime >= intervalStart && logTime < intervalEnd;
-          });
-
-          const intervalResponseTimes = intervalLogs
-            .filter((log) => log.details?.duration)
-            .map((log) => log.details.duration);
-
-          const intervalAvgResponseTime =
-            intervalResponseTimes.length > 0
-              ? intervalResponseTimes.reduce((sum, time) => sum + time, 0) /
-                intervalResponseTimes.length
-              : 0;
-
-          responseTimeData.push(Math.round(intervalAvgResponseTime));
-          throughputData.push(intervalLogs.length);
-        }
-
-        res.json({
-          success: true,
-          data: {
-            avgResponseTime: Math.round(avgResponseTime),
-            maxResponseTime: Math.round(maxResponseTime),
-            minResponseTime: Math.round(minResponseTime),
-            totalRequests: logs.length,
-            responseTimeData,
-            throughputData,
-          },
-        });
-      } catch (error: any) {
-        console.error("Error fetching performance metrics:", error);
-        res.status(500).json({
-          success: false,
-          message: "Failed to fetch performance metrics",
-          error:
-            process.env.NODE_ENV === "development" ? error.message : undefined,
-        });
-      }
-    },
-  );
-
-  // GET /api/metrics/resources - Get resource metrics (real system data + log analysis)
-  app.get(
-    "/api/metrics/resources",
-    authenticateApiKey,
-    async (req: Request, res: Response, next: NextFunction) => {
-      try {
-        const { timeRange = "24h", project, server } = req.query;
-
-        // Calculate time range
-        const now = new Date();
-        const timeRangeMs = {
-          "1h": 60 * 60 * 1000,
-          "24h": 24 * 60 * 60 * 1000,
-          "7d": 7 * 24 * 60 * 60 * 1000,
-          "30d": 30 * 24 * 60 * 60 * 1000,
-          "60d": 60 * 24 * 60 * 60 * 1000,
-          "90d": 90 * 24 * 60 * 60 * 1000,
-          "180d": 180 * 24 * 60 * 60 * 1000,
-          "365d": 365 * 24 * 60 * 60 * 1000,
-        };
-        const startTime = new Date(
-          now.getTime() -
-            (timeRangeMs[timeRange as keyof typeof timeRangeMs] ||
-              timeRangeMs["24h"]),
-        );
-
-        // Use the logs index and filter for source = "system_metrics"
-        const logsIndex = client.index(LOGS_INDEX);
-        let filter = `source = "system_metrics" AND timestamp >= "${startTime.toISOString()}"`;
-
-        if (project && project !== "all") {
-          filter += ` AND project = "${project}"`;
-        }
-        if (server && server !== "all") {
-          filter += ` AND server = "${server}"`;
-        }
-
-        const results = await logsIndex.search("", {
-          filter,
-          limit: 1000,
-          sort: ["timestamp:asc"],
-        });
-
-        const systemMetrics = results.hits as any[];
-        const useRealData = systemMetrics.length > 0;
-
-        let cpuUsageData: number[] = [];
-        let memoryUsageData: number[] = [];
-        let diskUsageData: number[] = [];
-        let networkData: number[] = [];
-        let currentCpuUsage = 0;
-        let currentMemoryUsage = 0;
-        let maxCpuUsage = 0;
-        let maxMemoryUsage = 0;
-        let avgCpuUsage = 0;
-        let avgMemoryUsage = 0;
-
-        const intervals = 20;
-        const intervalMs =
-          (timeRangeMs[timeRange as keyof typeof timeRangeMs] ||
-            timeRangeMs["24h"]) / intervals;
-
-        if (useRealData) {
-          // Process real system metrics
-          for (let i = 0; i < intervals; i++) {
-            const intervalStart = new Date(
-              startTime.getTime() + i * intervalMs,
-            );
-            const intervalEnd = new Date(intervalStart.getTime() + intervalMs);
-            const intervalMetrics = systemMetrics.filter((metric) => {
-              const metricTime = new Date(metric.timestamp);
-              return metricTime >= intervalStart && metricTime < intervalEnd;
-            });
-
-            if (intervalMetrics.length > 0) {
-              // Average metrics for this interval
-              const avgCpu =
-                intervalMetrics.reduce(
-                  (sum, m) => sum + (m.cpu?.usage || 0),
-                  0,
-                ) / intervalMetrics.length;
-              const avgMem =
-                intervalMetrics.reduce(
-                  (sum, m) => sum + (m.memory?.usage_percent || 0),
-                  0,
-                ) / intervalMetrics.length;
-
-              cpuUsageData.push(Math.round(avgCpu * 100) / 100);
-              memoryUsageData.push(Math.round(avgMem * 100) / 100);
-
-              // Extract disk and network data if available
-              const diskUsage =
-                intervalMetrics[0]?.disk?.usage?.["/"]?.usage_percent || 0;
-              const networkIn =
-                intervalMetrics.reduce((sum, m) => {
-                  const interfaces = Object.values(m.network || {});
-                  return (
-                    sum +
-                    interfaces.reduce(
-                      (netSum: number, iface: any) =>
-                        netSum + (iface.rx_rate_bytes_per_sec || 0),
-                      0,
-                    )
-                  );
-                }, 0) / intervalMetrics.length;
-
-              diskUsageData.push(diskUsage);
-              networkData.push(Math.round(networkIn / 1024)); // Convert to KB/s
-            } else {
-              // No data for this interval, push 0
-              cpuUsageData.push(0);
-              memoryUsageData.push(0);
-              diskUsageData.push(0);
-              networkData.push(0);
-            }
-          }
-
-          // Calculate current and aggregate values
-          const latestMetric = systemMetrics[systemMetrics.length - 1];
-          currentCpuUsage = latestMetric?.cpu?.usage || 0;
-          currentMemoryUsage = latestMetric?.memory?.usage_percent || 0;
-          maxCpuUsage = Math.max(...cpuUsageData);
-          maxMemoryUsage = Math.max(...memoryUsageData);
-          avgCpuUsage = Math.round(
-            cpuUsageData.reduce((sum, val) => sum + val, 0) /
-              cpuUsageData.length,
-          );
-          avgMemoryUsage = Math.round(
-            memoryUsageData.reduce((sum, val) => sum + val, 0) /
-              memoryUsageData.length,
-          );
-        }
-
-        // If no real data, return zeroed values
-        if (!useRealData) {
-          cpuUsageData = Array(intervals).fill(0);
-          memoryUsageData = Array(intervals).fill(0);
-          diskUsageData = Array(intervals).fill(0);
-          networkData = Array(intervals).fill(0);
-          currentCpuUsage = 0;
-          currentMemoryUsage = 0;
-          maxCpuUsage = 0;
-          maxMemoryUsage = 0;
-          avgCpuUsage = 0;
-          avgMemoryUsage = 0;
-        }
-
-        res.json({
-          success: true,
-          data: {
-            // Current values
-            currentCpuUsage: Math.round(currentCpuUsage * 100) / 100,
-            maxCpuUsage: Math.round(maxCpuUsage * 100) / 100,
-            avgCpuUsage: Math.round(avgCpuUsage * 100) / 100,
-            currentMemoryUsage: Math.round(currentMemoryUsage * 100) / 100,
-            maxMemoryUsage: Math.round(maxMemoryUsage * 100) / 100,
-            avgMemoryUsage: Math.round(avgMemoryUsage * 100) / 100,
-            // Time series data
-            cpuUsageData,
-            memoryUsageData,
-            diskUsageData,
-            networkData,
-            // Metadata
-            dataSource: useRealData ? "system_metrics" : "none",
-            hasRealData: useRealData,
-            totalDataPoints: useRealData ? systemMetrics?.length || 0 : 0,
-          },
-        });
-      } catch (error: any) {
-        console.error("Error fetching resource metrics:", error);
-        res.status(500).json({
-          success: false,
-          message: "Failed to fetch resource metrics",
           error:
             process.env.NODE_ENV === "development" ? error.message : undefined,
         });
