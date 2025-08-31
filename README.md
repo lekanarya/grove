@@ -1,4 +1,8 @@
-# Grove: Log Dashboard & Transport System
+
+<div style="max-width: 700px; margin: 0 auto; text-align: center;">
+   <img src="/assets/logo.png" height="120px" />
+<h1>Grove: Log Dashboard & Transport System</h1>
+</div>
 
 ![image1](./assets/screenshot1.png)
 ![image2](./assets/screenshot2.png)
@@ -35,7 +39,7 @@
 ## Installation
 
 ### Prerequisites
-- Node.js (v16+)
+- Node.js (v20+)
 - Meilisearch (v1.0+)
 - Bash (for log transport)
 - systemd (for log transport service)
@@ -49,7 +53,7 @@
 
 2. **Install Dependencies**:
    ```bash
-   npm install
+   yarn install
    ```
 
 3. **Set Up Meilisearch**:
@@ -60,32 +64,18 @@
 
 4. **Configure Environment**:
    Create a `.env` file:
-   ```env
-   MEILI_URL=http://localhost:7700
-   MEILI_API_KEY=YOUR_MASTER_KEY
-   ```
+   - Copy
 
-5. **Start the Backend**:
+5. **For Development**:
    ```bash
-   npm run start:backend
+   yarn dev
    ```
 
-6. **Start the Frontend**:
+6. **For Production**:
    ```bash
-   npm run start:frontend
+   yarn production
+   yarn production:restart
    ```
-
-7. **Set Up Log Transport**:
-   - Copy the Bash script to `/usr/local/bin/grove-log-transport`.
-   - Create a systemd service file at `/etc/systemd/system/grove-log-transport.service`.
-   - Enable and start the service:
-     ```bash
-     sudo systemctl daemon-reload
-     sudo systemctl enable grove-log-transport
-     sudo systemctl start grove-log-transport
-     ```
-
----
 
 ## Configuration
 
@@ -94,59 +84,21 @@
 - Configure Meilisearch indexes for each log type (e.g., `apache`, `nginx`).
 
 ### Log Sources
-- Edit the Bash script to include paths to your log files:
-  ```bash
-  LOG_SOURCES=(
-    "/var/log/apache2/access.log"
-    "/var/log/nginx/error.log"
-    "/var/log/syslog"
-    "/home/user/.pm2/logs/out.log"
-    "/var/www/laravel/storage/logs/laravel.log"
-  )
-  ```
+- Copy [pipeline/setup.sh](/pipeline/setup.sh) and run on the server you have the logs.
+- Copy [pipeline/grove.sh](/pipeline/grove.sh) and paste inside `/etc/grove/grove.sh`
 
----
-
-## Log Transport
-
-### Bash Script
-The script tails log files and sends new entries to the Grove backend:
-```bash
-#!/bin/bash
-while true; do
-  for log in "${LOG_SOURCES[@]}"; do
-    tail -n 10 "$log" | while read line; do
-      curl -X POST "http://localhost:3000/api/logs" \
-        -H "Content-Type: application/json" \
-        -d "{\"source\":\"$(basename $log)\",\"message\":\"$line\"}"
-    done
-  done
-  sleep 5
-done
+### Log Transport
+```sh
+sudo systemctl daemon-reload
+sudo systemctl enable grove
+sudo systemctl start grove
 ```
 
-### systemd Service
-Create `/etc/systemd/system/grove-log-transport.service`:
-```ini
-[Unit]
-Description=Grove Log Transport Service
-After=network.target
-
-[Service]
-ExecStart=/usr/local/bin/grove-log-transport
-Restart=always
-User=root
-
-[Install]
-WantedBy=multi-user.target
-```
-
----
 
 ## Dashboard Usage
 
 ### Accessing the Dashboard
-- Open `http://localhost:3000` in your browser.
+- Open `http://localhost:3211` in your browser.
 
 ### Features
 - **Search**: Use the search bar to find logs by keyword.
@@ -156,22 +108,14 @@ WantedBy=multi-user.target
 
 ---
 
-## API Endpoints
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/api/logs` | POST | Ingest a new log entry |
-| `/api/logs` | GET | Retrieve logs (supports query parameters) |
-| `/api/stats` | GET | Get log statistics (e.g., count by source) |
-
----
 
 ## Troubleshooting
 
 ### Common Issues
 - **Meilisearch Connection**: Ensure Meilisearch is running and the API key is correct.
-- **Log Transport**: Check systemd logs with `journalctl -u grove-log-transport`.
-- **Dashboard Errors**: Verify the backend and frontend are running on the correct ports.
+- **Grove Service**: Check systemd status with `systemctl status grove.service`.
+- **Log Transport**: Check Grove logs with `tail -f /var/log/grove.log`.
+- **Dashboard Errors**: Verify Grove frontend is running on the correct port.
 
 ---
 
