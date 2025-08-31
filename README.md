@@ -3,6 +3,7 @@
    <img src="/assets/logo.png" height="120px" />
 <h1>Grove: Log Dashboard & Transport System</h1>
 </div>
+![git workflow](https://github.com/kimolalekan/grove/actions/workflows/build.yml/badge.svg?branch=main)
 
 ![image1](./assets/screenshot1.png)
 ![image2](./assets/screenshot2.png)
@@ -13,11 +14,9 @@
 2. [Features](#features)
 3. [Installation](#installation)
 5. [Configuration](#configuration)
-6. [Log Transport](#log-transport)
-7. [Dashboard Usage](#dashboard-usage)
-8. [API Endpoints](#api-endpoints)
-9. [Troubleshooting](#troubleshooting)
-10. [Contributing](#contributing)
+6. [Dashboard Usage](#dashboard-usage)
+7. [Troubleshooting](#troubleshooting)
+8. [Contributing](#contributing)
 
 ---
 
