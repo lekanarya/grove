@@ -39,7 +39,7 @@
     --font-serif: Georgia, serif;
     --font-mono: Menlo, monospace;
     --radius: 1.3rem;
-    --admin-green: #20b072; /* Changed from hsl(217.2, 91.2%, 59.8%) to #20B072 */
+    --admin-green: #20b072;
     --admin-gray: hsl(210, 20%, 98%);
 }
 

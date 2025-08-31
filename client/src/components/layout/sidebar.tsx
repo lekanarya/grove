@@ -148,7 +148,7 @@ export default function Sidebar({
             <div className="w-8 h-8 rounded-lg flex items-center justify-center">
               <img src={logoImage} alt="Grove Logo" className="w-6 h-6" />
             </div>
-            <span className="ml-3 text-xl font-bold">Grove</span>
+            <span className="ml-3 text-xl font-bold text-green-900">Grove</span>
           </div>
           <div className="flex items-center space-x-2">
             <Button
