@@ -3,9 +3,12 @@
    <img src="/assets/logo.png" height="120px" />
 <h1>Grove: Log Dashboard & Transport System</h1>
 </div>
+
 [![Build Pipeline](https://github.com/kimolalekan/grove/actions/workflows/build.yml/badge.svg)](https://github.com/kimolalekan/grove/actions/workflows/build.yml)
+
 ![image1](./assets/screenshot1.png)
 ![image2](./assets/screenshot2.png)
+
 ---
 
 ## Table of Contents
