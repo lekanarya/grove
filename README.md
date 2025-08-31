@@ -1,10 +1,15 @@
-
-<div style="max-width: 700px; margin: 0 auto; text-align: center;">
-   <img src="/assets/logo.png" height="120px" />
-<h1>Grove: Log Dashboard & Transport System</h1>
-</div>
+<p align="center">
+  <a href="#">
+    <img src="https://raw.githubusercontent.com/kimolalekan/grove/main/assets/grove-wordmark.png">
+  </a>
+</p>
+<div align="center">
 
 [![Build Pipeline](https://github.com/kimolalekan/grove/actions/workflows/build.yml/badge.svg)](https://github.com/kimolalekan/grove/actions/workflows/build.yml)
+
+</div>
+
+
 
 ![image1](./assets/screenshot1.png)
 ![image2](./assets/screenshot2.png)
